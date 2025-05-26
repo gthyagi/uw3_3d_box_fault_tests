@@ -1,4 +1,4 @@
-# ### Case3: Anisotropic with fault
+# ### Case3: Mesh with fault
 
 import underworld3 as uw
 import numpy as np
@@ -97,7 +97,7 @@ pv_mesh_d = sample_points.compute_implicit_distance(fault_surf_poly)
 sample_points.point_data["df"] = pv_mesh_d.point_data["implicit_distance"]
 
 with mesh.access(fault_dist):
-    fault_dist.data[:, 0] =sample_points.point_data["df"]
+    fault_dist.data[:, 0] = sample_points.point_data["df"]
 
 # +
 ## Map fault normals (computed by pyvista)
@@ -109,8 +109,6 @@ with mesh.access(fault_norm):
     mask = dist < mesh.get_min_radius() * 2.5
     fault_norm.data[mask] = fault_surf_poly.point_data["Normals"][closest_points[mask]]
 # -
-
-sample_points
 
 if uw.mpi.size == 1:
     pv_mesh = vis.mesh_to_pv_mesh(mesh)

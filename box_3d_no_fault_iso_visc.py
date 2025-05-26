@@ -1,19 +1,23 @@
-# ### Case1: isoviscous with no fault
+# ### Case1: Non refined mesh with no fault
 
 import underworld3 as uw
 import numpy as np
 import sympy
 import os
+from enum import Enum
+from underworld3 import timing
+import pyvista as pv
 
 if uw.mpi.size == 1:
     # to fix trame issue
     import nest_asyncio
     nest_asyncio.apply()
     
-    import pyvista as pv
     import underworld3.visualisation as vis
     import matplotlib.pyplot as plt
     import cmcrameri.cm as cmc
+
+os.environ["UW_TIMING_ENABLE"] = "1"
 
 # +
 # output dir
@@ -25,10 +29,10 @@ if uw.mpi.rank == 0:
 
 # +
 # mesh parameter
-res = uw.options.getReal("res", default=1/5) # 8, 16, 32, 64, 128
+res = uw.options.getReal("res", default=1/4) # 8, 16, 32, 64, 128
 cellsize = 1/res
-minX, minY, minZ = 0., 0., 0.
-maxX, maxY, maxZ = 150., 150., -40.
+minX, minY, minZ = 0., 0., -40.
+maxX, maxY, maxZ = 150., 150., 0.
 
 
 vdegree  = uw.options.getInt("vdegree", default=2)
@@ -52,54 +56,70 @@ if uw.mpi.size == 1:
     mesh.view()
 
 # mesh variables
-v = uw.discretisation.MeshVariable('V', mesh, mesh.data.shape[1], degree=vdegree)
-p = uw.discretisation.MeshVariable('P', mesh, 1, degree=pdegree, continuous=pcont)
+v_soln = uw.discretisation.MeshVariable('V', mesh, mesh.data.shape[1], degree=vdegree)
+p_soln = uw.discretisation.MeshVariable('P', mesh, 1, degree=pdegree, continuous=pcont)
+strain_rate_inv2 = uw.discretisation.MeshVariable("eps", mesh, 1, degree=1)
 
 # Create Stokes object
-stokes = uw.systems.Stokes(mesh, velocityField=v, pressureField=p)
+stokes = uw.systems.Stokes(mesh, velocityField=v_soln, pressureField=p_soln)
 stokes.constitutive_model = uw.constitutive_models.ViscousFlowModel
 stokes.constitutive_model.Parameters.viscosity = 1.0
 stokes.saddle_preconditioner = 1.0
 
+# +
 # set up boundary conditions
-vel_x = 1.0
-stokes.add_dirichlet_bc((vel_x, sympy.oo, sympy.oo), "Left")
-stokes.add_dirichlet_bc((-vel_x, sympy.oo, sympy.oo), "Right")
+stokes.add_essential_bc(
+    [1, 0, 0],
+    mesh.boundaries.Left.name,
+)
+stokes.add_essential_bc(
+    [-1, 0, 0],
+    mesh.boundaries.Right.name,
+)
+stokes.add_essential_bc(
+    [None, None, 0],
+    mesh.boundaries.Bottom.name,
+)
+stokes.add_essential_bc(
+    [None, 0, None],
+    mesh.boundaries.Front.name,
+)
+stokes.add_essential_bc(
+    [None, 0, None],
+    mesh.boundaries.Back.name,
+)
+
+stokes.bodyforce = -1 * mesh.CoordinateSystem.unit_k
 
 # +
-# Stokes settings
-stokes.tolerance = stokes_tol
 stokes.petsc_options["ksp_monitor"] = None
+stokes.petsc_options["snes_monitor"] = None
+stokes.petsc_options["snes_atol"] = 1.0e-4
 
-stokes.petsc_options["snes_type"] = "newtonls"
-stokes.petsc_options["ksp_type"] = "fgmres"
+stokes.petsc_options["fieldsplit_velocity_ksp_type"] = "cg"
+stokes.petsc_options["fieldsplit_velocity_pc_type"] = "mg"
 
-# stokes.petsc_options.setValue("fieldsplit_velocity_pc_type", "mg")
-stokes.petsc_options.setValue("fieldsplit_velocity_pc_mg_type", "kaskade")
-stokes.petsc_options.setValue("fieldsplit_velocity_pc_mg_cycle_type", "w")
+stokes.petsc_options["fieldsplit_pressure_ksp_type"] = "gmres"
+stokes.petsc_options["fieldsplit_pressure_pc_type"] = "mg"
 
-stokes.petsc_options["fieldsplit_velocity_mg_coarse_pc_type"] = "svd"
+timing.reset()
+timing.start()
 
-stokes.petsc_options[f"fieldsplit_velocity_ksp_type"] = "fcg"
-stokes.petsc_options[f"fieldsplit_velocity_mg_levels_ksp_type"] = "chebyshev"
-stokes.petsc_options[f"fieldsplit_velocity_mg_levels_ksp_max_it"] = 5
-stokes.petsc_options[f"fieldsplit_velocity_mg_levels_ksp_converged_maxits"] = None
+stokes.solve(zero_init_guess=False)
 
-# # gasm is super-fast ... but mg seems to be bulletproof
-# # gamg is toughest wrt viscosity
-# stokes.petsc_options.setValue("fieldsplit_pressure_pc_type", "gamg")
-# stokes.petsc_options.setValue("fieldsplit_pressure_pc_mg_type", "additive")
-# stokes.petsc_options.setValue("fieldsplit_pressure_pc_mg_cycle_type", "v")
+timing.print_table(display_fraction=0.999)
 
-# mg, multiplicative - very robust ... similar to gamg, additive
-stokes.petsc_options.setValue("fieldsplit_pressure_pc_type", "mg")
-stokes.petsc_options.setValue("fieldsplit_pressure_pc_mg_type", "multiplicative")
-stokes.petsc_options.setValue("fieldsplit_pressure_pc_mg_cycle_type", "v")
+# +
+nodal_strain_rate_inv2 = uw.systems.Projection(mesh, strain_rate_inv2)
+nodal_strain_rate_inv2.uw_function = stokes.Unknowns.Einv2
+nodal_strain_rate_inv2.smoothing = 1.0e-2
+nodal_strain_rate_inv2.petsc_options["ksp_monitor"] = None
+nodal_strain_rate_inv2.petsc_options["snes_monitor"] = None
+
+nodal_strain_rate_inv2.solve()
 # -
 
-stokes.solve(verbose=True, debug=False)
-
 # saving h5 and xdmf file
-mesh.petsc_save_checkpoint(index=0, meshVars=[v, p], outputPath=os.path.relpath(output_dir)+'/output')
+mesh.petsc_save_checkpoint(index=0, meshVars=[v_soln, p_soln, strain_rate_inv2], outputPath=os.path.relpath(output_dir)+'/output')
 
 
