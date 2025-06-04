@@ -474,3 +474,47 @@ if __name__ == "__main__":
     )
 
 
+
+# +
+import gmsh
+import sys
+import numpy as np
+
+gmsh.initialize()
+gmsh.model.add("ImplicitSurface")
+
+# Define the region (box) where we search for the isosurface
+xmin, ymin, zmin = -1.5, -1.5, -1.5
+dx, dy, dz = 3.0, 3.0, 3.0
+box = gmsh.model.occ.addBox(xmin, ymin, zmin, dx, dy, dz)
+gmsh.model.occ.synchronize()
+
+# Define the implicit function as a MathEval field (e.g., sphere: x^2 + y^2 + z^2 - 1)
+field = gmsh.model.mesh.field.add("MathEval")
+gmsh.model.mesh.field.setString(field, "F", "x^2 + y^2 + z^2 - 1")
+
+# Now use the Isosurface plugin
+# (This is a plugin, so you need to run the plugin after setting parameters)
+iso = gmsh.plugin.setNumber("Isosurface", "Field", field)
+gmsh.plugin.setNumber("Isosurface", "Value", 0.0)  # Level set value (isosurface)
+gmsh.plugin.setNumber("Isosurface", "ExtractVolume", 0)  # Surface only
+gmsh.plugin.setNumber("Isosurface", "Map", 0)  # Do not map fields to result
+
+# Run the plugin
+gmsh.plugin.run("Isosurface")
+
+# Generate the mesh (not strictly needed for surface, but safe)
+gmsh.model.mesh.generate(2)
+
+# Optionally, save the mesh
+gmsh.write("implicit_surface.msh")
+
+# Launch the GUI to view, if desired
+if '-nopopup' not in sys.argv:
+    gmsh.fltk.run()
+
+gmsh.finalize()
+
+# -
+
+
