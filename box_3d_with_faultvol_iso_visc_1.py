@@ -1,4 +1,4 @@
-# ### Case2: Refined mesh with no fault
+# ### Case4: Mesh with fault Volume
 
 import underworld3 as uw
 import numpy as np
@@ -7,6 +7,7 @@ import os
 from enum import Enum
 from underworld3 import timing
 import pyvista as pv
+import math
 
 if uw.mpi.size == 1:
     # to fix trame issue
@@ -22,7 +23,7 @@ os.environ["UW_TIMING_ENABLE"] = "1"
 # +
 # output dir
 output_dir = os.path.join(os.path.join("./output/"), 
-                          f'box_3d_refined_iso_visc')
+                          f'box_3d_iso_visc_with_faultvolume_1')
 
 if uw.mpi.rank == 0:
     os.makedirs(output_dir, exist_ok=True)
@@ -47,6 +48,7 @@ class boundaries_3D(Enum):
     Left = 14
     Front = 15
     Back = 16
+    Fault = 17
 
 class boundary_normals_3D(Enum):
     Bottom = sympy.Matrix([0, 0, 1])
@@ -60,7 +62,7 @@ class boundary_normals_3D(Enum):
 # -
 
 # create mesh
-mesh = uw.discretisation.Mesh(f'./output/meshes/box_3d_refined_around_fault.msh', 
+mesh = uw.discretisation.Mesh(f'./output/meshes/box_3d_with_faultvolume.msh', 
                               boundaries=boundaries_3D, 
                               boundary_normals=boundary_normals_3D, 
                               useMultipleTags=True, 
@@ -73,59 +75,100 @@ if uw.mpi.size == 1:
 if uw.mpi.size == 1:
     mesh.view()
 
+# Get the FaultVolume label value
+faultvolume_value = 2
+faultvolume_is = mesh.dm.getStratumIS('FaultVolume', faultvolume_value)
+
 # mesh variables
 v_soln = uw.discretisation.MeshVariable('V', mesh, mesh.data.shape[1], degree=vdegree)
 p_soln = uw.discretisation.MeshVariable('P', mesh, 1, degree=pdegree, continuous=pcont)
 strain_rate_inv2 = uw.discretisation.MeshVariable("eps", mesh, 1, degree=1)
-fault_dist = uw.discretisation.MeshVariable("df", mesh, 1, degree=2, continuous=False)
+# fault_dist = uw.discretisation.MeshVariable("df", mesh, 1, degree=2, continuous=False)
+eta_1 = uw.discretisation.MeshVariable("eta", mesh, 1, degree=1, continuous= not False)
 fault_norm = uw.discretisation.MeshVariable("nf", mesh, mesh.dim, degree=1, continuous=True, varsymbol=r"{\hat{n}}")
 
 # +
-# read fault surface
-fault_surf = pv.read("./output/meshes/fault_surface.msh")
-if uw.mpi.size == 1:
-    fault_surf.plot(style='wireframe', color='k',)
-    
-fault_surf_poly = fault_surf.extract_surface()
-fault_surf_poly.compute_normals(inplace=True)
+# Get global indices of all vertices (depth 0)
+vertex_is = mesh.dm.getStratumIS('depth', 0)
+global_vertex_indices = vertex_is.indices if vertex_is is not None else []
+global_to_local = {g: i for i, g in enumerate(global_vertex_indices)}
+
+# Get FaultVolume cell indices
+faultvolume_is = mesh.dm.getStratumIS('FaultVolume', 2)
+fault_nodes_global = set()
+
+if faultvolume_is is not None and global_vertex_indices is not None:
+    for cell in faultvolume_is.indices:
+        for face in mesh.dm.getCone(cell):
+            for pt in mesh.dm.getCone(face):
+                depth = mesh.dm.getLabelValue('depth', pt)
+                if depth == 0:
+                    fault_nodes_global.add(pt)
+                elif depth in (1, 2):  # If not vertex, descend once more
+                    for subpt in mesh.dm.getCone(pt):
+                        if mesh.dm.getLabelValue('depth', subpt) == 0:
+                            fault_nodes_global.add(subpt)
+    # Map global indices to local indices (for fault_norm.data)
+    fault_nodes_local = [
+        global_to_local[g] for g in fault_nodes_global if g in global_to_local
+    ]
+    fault_nodes_local = np.array(fault_nodes_local, dtype=int)
+    # print(f"FaultVolume nodal local indices: {fault_nodes_local}")
 
 # +
-## Fault distance function (using pyvista)
-sample_points = pv.PolyData(fault_dist.coords)
-pv_mesh_d = sample_points.compute_implicit_distance(fault_surf_poly)
-sample_points.point_data["df"] = pv_mesh_d.point_data["implicit_distance"]
+# Assign value to fault_norm at these nodes
+fault_angle = 45
 
-with mesh.access(fault_dist):
-    fault_dist.data[:, 0] = sample_points.point_data["df"]
+with mesh.access(fault_norm, eta_1):
+    fault_norm.data[fault_nodes_local] = [math.cos(math.radians(fault_angle)), 0.0, math.sin(math.radians(fault_angle))]
+    eta_1.data[fault_nodes_local] = 0.001
 
 # +
-## Map fault normals (computed by pyvista)
-fault_kdtree = uw.kdtree.KDTree(fault_surf_poly.points)
+# # read fault surface
+# fault_surf = pv.read("./output/meshes/fault_surface.msh")
+# if uw.mpi.size == 1:
+#     fault_surf.plot(style='wireframe', color='k',)
+    
+# fault_surf_poly = fault_surf.extract_surface()
+# fault_surf_poly.compute_normals(inplace=True)
 
-with mesh.access(fault_norm):
-    closest_points, dist_sq, _ = fault_kdtree.find_closest_point(fault_norm.coords)
-    dist = np.sqrt(dist_sq)
-    mask = dist < mesh.get_min_radius() * 2.5
-    fault_norm.data[mask] = fault_surf_poly.point_data["Normals"][closest_points[mask]]
-# -
+# +
+# ## Fault distance function (using pyvista)
+# sample_points = pv.PolyData(fault_dist.coords)
+# pv_mesh_d = sample_points.compute_implicit_distance(fault_surf_poly)
+# sample_points.point_data["df"] = pv_mesh_d.point_data["implicit_distance"]
 
-if uw.mpi.size == 1:
-    pv_mesh = vis.mesh_to_pv_mesh(mesh)
-    pv_mesh.point_data["norm"] = uw.function.evalf(fault_norm.sym, pv_mesh.points)
-    pv_mesh.point_data["dist"] = uw.function.evalf(fault_dist.sym, pv_mesh.points)
+# with mesh.access(fault_dist):
+#     fault_dist.data[:, 0] = sample_points.point_data["df"]
+
+# +
+# ## Map fault normals (computed by pyvista)
+# fault_kdtree = uw.kdtree.KDTree(fault_surf_poly.points)
+
+# with mesh.access(fault_norm):
+#     closest_points, dist_sq, _ = fault_kdtree.find_closest_point(fault_norm.coords)
+#     dist = np.sqrt(dist_sq)
+#     mask = dist < mesh.get_min_radius() * 1.5
+#     fault_norm.data[mask] = fault_surf_poly.point_data["Normals"][closest_points[mask]]
+
+# +
+# if uw.mpi.size == 1:
+#     pv_mesh = vis.mesh_to_pv_mesh(mesh)
+#     pv_mesh.point_data["norm"] = uw.function.evalf(fault_norm.sym, pv_mesh.points)
+#     pv_mesh.point_data["dist"] = uw.function.evalf(fault_dist.sym, pv_mesh.points)
     
-    pv_mesh_clipped = pv_mesh.clip(normal="y", origin=(0,0.5,0))
+#     pv_mesh_clipped = pv_mesh.clip(normal="y", origin=(0,0.5,0))
     
-    pl = pv.Plotter(window_size=[1000, 1000])
+#     pl = pv.Plotter(window_size=[1000, 1000])
     
-    pl.add_mesh(pv_mesh, style="wireframe")
-    pl.add_mesh(pv_mesh_clipped, scalars="dist", cmap="RdBu_r", clim=(-0.5,0.5))
+#     pl.add_mesh(pv_mesh, style="wireframe")
+#     pl.add_mesh(pv_mesh_clipped, scalars="dist", cmap="RdBu_r", clim=(-0.5,0.5))
     
-    # pl.add_points(sample_points, scalars="df", cmap="RdBu", clim=(-0.5,0.5))
-    pl.add_arrows(pv_mesh.points, pv_mesh.point_data["norm"], mag=2)
-    pl.add_mesh(fault_surf_poly, style='wireframe', color='k')
+#     # pl.add_points(sample_points, scalars="df", cmap="RdBu", clim=(-0.5,0.5))
+#     pl.add_arrows(pv_mesh.points, pv_mesh.point_data["norm"], mag=2)
+#     pl.add_mesh(fault_surf_poly, style='wireframe', color='k')
     
-    pl.show()
+#     pl.show()
 
 # +
 ## Solver
@@ -137,11 +180,14 @@ stokes = uw.systems.Stokes(mesh, velocityField=v_soln, pressureField=p_soln)
 
 stokes.constitutive_model = uw.constitutive_models.TransverseIsotropicFlowModel
 stokes.constitutive_model.Parameters.eta_0 = 1
+# stokes.constitutive_model.Parameters.eta_1 = 0 + sympy.Piecewise(
+#     (0.001, fault_dist.sym[0] < mesh.get_min_radius() * 1.5),
+#     (1, True),
+# )
 stokes.constitutive_model.Parameters.eta_1 = 0 + sympy.Piecewise(
-    (0.001, fault_dist.sym[0] < mesh.get_min_radius() * 2),
+    (0.001, eta_1.sym[0] < 0.002),
     (1, True),
 )
-
 stokes.constitutive_model.Parameters.director = fault_norm.sym
 
 stokes.penalty = 1.0
@@ -229,49 +275,12 @@ if uw.mpi.size == 1:
     pl.show()
 
 # +
-# input dir
-input_dir_ref = os.path.join(os.path.join("./output/"), f'box_3d_no_fault_iso_visc')
-
-# load mesh
-mesh_ref = uw.discretisation.Mesh(f'{input_dir_ref}/mesh.msh.h5')
-
-# create mesh variable
-v_soln_ref = uw.discretisation.MeshVariable('V', mesh_ref, mesh_ref.data.shape[1], degree=vdegree)
-
-# load mesh variable
-v_soln_ref.read_timestep(data_filename='v_sol', data_name='V', index=0, outputPath=input_dir_ref)
-# -
-
-# fault mesh variable to store reference velocity with no fault
-v_soln_ref2nonref = uw.discretisation.MeshVariable('V_ref', mesh, mesh.data.shape[1], degree=vdegree)
-
-# transferring information b/w meshvariables
-uw.adaptivity.mesh2mesh_meshVariable(v_soln_ref, v_soln_ref2nonref, )
-
-# mesh variable for diff on fault mesh
-v_sol_diff_non_ref = uw.discretisation.MeshVariable('V_diff', mesh, mesh.data.shape[1], degree=vdegree)
-
-with mesh.access(v_sol_diff_non_ref):
-    v_sol_diff_non_ref.data[...] = uw.function.evalf(v_soln_ref2nonref.sym - v_soln.sym, v_sol_diff_non_ref.coords)
-
 # saving h5 and xdmf file
-mesh.petsc_save_checkpoint(index=0, meshVars=[v_soln, p_soln, strain_rate_inv2, fault_dist, fault_norm, 
-                                              v_soln_ref2nonref, v_sol_diff_non_ref], outputPath=os.path.relpath(output_dir)+'/output')
 
-# +
-# working method for reload
-# mesh_h5_name = f'{output_dir}/output_mesh.h5'
+# mesh.petsc_save_checkpoint(index=0, meshVars=[v_soln, p_soln, strain_rate_inv2, fault_norm, eta_1], outputPath=os.path.relpath(output_dir)+'/output')
 
-# mesh_h5 = mesh.write(mesh_h5_name, index=0)
-# v_soln.write(f'{output_dir}/v_sol.mesh.V.00000.h5')
-# p_soln.write(f'{output_dir}/p_sol.mesh.P.00000.h5')
-# strain_rate_inv2.write(f'{output_dir}/sr_inv.mesh.eps.00000.h5')
-
-# v_soln.save(mesh_h5_name, name='V')
-# p_soln.save(mesh_h5_name, name='P')
-# strain_rate_inv2.save(mesh_h5_name, name='eps')
-
-# mesh.generate_xdmf(mesh_h5_name)
+mesh.write_timestep(filename='output', index=0, outputPath=output_dir,
+                    meshVars=[v_soln, p_soln, strain_rate_inv2, fault_norm, eta_1])
 # -
 
 

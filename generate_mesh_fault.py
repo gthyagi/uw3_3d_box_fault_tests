@@ -241,15 +241,242 @@ def Box3DwithFault(
     gmsh.finalize()
 
 
+# +
+# if __name__ == "__main__":
+#     Box3DwithFault(startCoords=(startX, startY, startZ), 
+#                    endCoords=(endX, endY, endZ),
+#                    filename=f'{output_dir}/box_3d_with_fault.msh',
+#                    boundaries=boundaries_3D,
+#                    DX_FAULT=1.5,
+#                    DX_BIAS=1.12,
+#                    gmsh_verbosity=1,
+#                    gui=False)
+# -
+
+def Box3DwithFaultVolume(
+    startCoords: Tuple = (0., 0., 0.),
+    endCoords: Tuple = (150., 150., -40.),
+    fault_s_point = (75., 25., 0.0),
+    fault_e_point = (75., 125., 0.0),
+    fault_angle=-45,
+    fault_depth=30,
+    DX_FAULT = 1.5,
+    DX_BIAS = 1.02,
+    gmsh_verbosity=0,
+    boundaries=None,
+    filename=None,
+    gui=False
+):
+    """
+    Generates a 3-dimensional box mesh with fault.
+
+    DX_FAULT: float = 1.5
+    Target element size directly on the fault surface.
+    
+    DX_BIAS: float = 1.02
+    Geometric progression factor controlling the grading of elements away from the fault.
+    """    
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Verbosity", gmsh_verbosity)
+    gmsh.model.add("Box3D")
+    
+    # Create domain
+    sx, sy, sz = startCoords
+    ex, ey, ez = endCoords
+    v_domain = gmsh.model.occ.add_box(sx, sy, sz, ex - sx, ey - sy, ez - sz)
+    
+    # creating fault line
+    f_pt_s = gmsh.model.occ.add_point(*fault_s_point)
+    f_pt_e = gmsh.model.occ.add_point(*fault_e_point)
+    f_line = gmsh.model.occ.add_line(f_pt_s, f_pt_e)
+    
+    # extrude fault line to create fault surface
+    dimTags = gmsh.model.occ.extrude([(1, f_line)], 
+                                     fault_depth * math.cos(math.radians(fault_angle)), 
+                                     fault_depth * 0.0, 
+                                     fault_depth * math.sin(math.radians(fault_angle)), 
+                                     # numElements=[100] # controls no. of in fault 
+                                    )
+    fault_surf_tag = dimTags[1][1]
+
+    # Extrude surface to create a fault volume (one element thick)
+    fault_volume_extrude = gmsh.model.occ.extrude(
+        [(2, fault_surf_tag)],
+        1., 0., 0.,
+        numElements=[1],     # one element thick
+        recombine=False
+    )
+    fault_volume = fault_volume_extrude[1][1]
+    
+    # Fragment with domain
+    gmsh.model.occ.fragment([(3, v_domain)], [(3, fault_volume)], removeTool=True, removeObject=True)
+    gmsh.model.occ.synchronize()
+
+
+    # ----- CREATE PHYSICAL GROUPS FOR BOTH VOLUMES -----
+    # Get all volume tags after fragment
+    volumes = [v[1] for v in gmsh.model.getEntities(dim=3)]
+    
+    if len(volumes) != 2:
+        print(f"Warning: Expected 2 volumes, found {len(volumes)}")
+    
+    # Get volumes and their sizes
+    vol_sizes = [(v, gmsh.model.occ.getMass(3, v)) for v in volumes]
+    
+    # Sort by size: largest first (host), smallest second (fault)
+    vol_sizes_sorted = sorted(vol_sizes, key=lambda x: x[1], reverse=True)
+    
+    host_tag = vol_sizes_sorted[0][0]
+    fault_tag = vol_sizes_sorted[1][0]
+    
+    # Assign physical groups
+    host_group = gmsh.model.addPhysicalGroup(3, [host_tag])
+    gmsh.model.setPhysicalName(3, host_group, "HostVolume")
+    
+    fault_group = gmsh.model.addPhysicalGroup(3, [fault_tag])
+    gmsh.model.setPhysicalName(3, fault_group, "FaultVolume")
+
+
+    # Fetch box extents from host volume
+    xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(3, host_tag)
+    tol = 1e-5
+
+    # Function to map boundary surfaces for a given volume
+    def get_surface_map(volume_tag, boundaries, fault_surf_tag=None):
+        _, surfaces = gmsh.model.get_adjacencies(3, volume_tag)
+        surface_map = {}
+    
+        for surf in surfaces:
+            sxmin, symin, szmin, sxmax, symax, szmax = gmsh.model.getBoundingBox(2, surf)
+            cx = 0.5 * (sxmin + sxmax)
+            cy = 0.5 * (symin + symax)
+            cz = 0.5 * (szmin + szmax)
+    
+            if abs(cx - xmin) < tol:
+                surface_map[boundaries.Left] = surf
+                continue
+            if abs(cx - xmax) < tol:
+                surface_map[boundaries.Right] = surf
+                continue
+            if abs(cy - ymin) < tol:
+                surface_map[boundaries.Front] = surf
+                continue
+            if abs(cy - ymax) < tol:
+                surface_map[boundaries.Back] = surf
+                continue
+            if abs(cz - zmin) < tol:
+                surface_map[boundaries.Bottom] = surf
+                continue
+            if abs(cz - zmax) < tol:
+                surface_map[boundaries.Top] = surf
+                continue
+    
+        if fault_surf_tag is not None:
+            surface_map[boundaries.Fault] = fault_surf_tag
+    
+        return surface_map
+
+    # Get surface maps for host and fault
+    host_surface_map = get_surface_map(host_tag, boundaries)
+    fault_surface_map = get_surface_map(fault_tag, boundaries, fault_surf_tag=fault_surf_tag)
+
+    # --- COLLECT all upper faces for combined group ---
+    host_upper = host_surface_map.get(boundaries.Top)
+    fault_upper = None
+
+    # For the fault volume, the "top" face may not always be identified by the above logic.
+    # So, find by centroid z ~ zmax (coplanar with host top)
+    _, fault_surfaces = gmsh.model.get_adjacencies(3, fault_tag)
+    for surf in fault_surfaces:
+        sxmin, symin, szmin, sxmax, symax, szmax = gmsh.model.getBoundingBox(2, surf)
+        cz = 0.5 * (szmin + szmax)
+        if abs(cz - zmax) < tol:
+            fault_upper = surf
+            break
+
+    # # Now create a single physical group for the UpperSurface if both found
+    # upper_faces = []
+    # if host_upper: upper_faces.append(host_upper)
+    # if fault_upper: upper_faces.append(fault_upper)
+    # if upper_faces:
+    #     group_tag = gmsh.model.addPhysicalGroup(2, upper_faces)
+    #     gmsh.model.setPhysicalName(2, group_tag, "UpperSurface")
+    
+    upper_faces = []
+    if host_upper: upper_faces.append(host_upper)
+    if fault_upper: upper_faces.append(fault_upper)
+    if upper_faces:
+        group_tag = gmsh.model.addPhysicalGroup(2, upper_faces, boundaries.Top.value)
+        gmsh.model.setPhysicalName(2, group_tag, boundaries.Top.name)
+
+
+    # Create boundary groups for all faces in host (except top, which is now combined)
+    for side, tag in host_surface_map.items():
+        if side == boundaries.Top:
+            continue
+        BoundaryGroup(
+            name=side.name,
+            tag=side.value,
+            dim=2,
+            entities=[tag]
+        ).create_physical_group()
+
+    # Do the same for the fault volume (except upper, which is combined, and maybe except Fault if you already group it elsewhere)
+    for side, tag in fault_surface_map.items():
+        if (fault_upper is not None and tag == fault_upper) or side == boundaries.Top:
+            continue
+        BoundaryGroup(
+            name=side.name,
+            tag=side.value,
+            dim=2,
+            entities=[tag]
+        ).create_physical_group()
+
+    gmsh.model.occ.synchronize()
+
+    # We turn off the default sizing methods.
+    gmsh.option.set_number("Mesh.MeshSizeFromPoints", 0)
+    gmsh.option.set_number("Mesh.MeshSizeFromCurvature", 0)
+    gmsh.option.set_number("Mesh.MeshSizeExtendFromBoundary", 0)
+
+    # First, we setup a field `field_distance` with the distance from the fault.
+    field_distance = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(field_distance, "SurfacesList", [fault_surf_tag])
+
+    # Second, we setup a field `field_size`, which is the mathematical expression
+    # for the cell size as a function of the cell size on the fault, the distance from
+    # the fault (as given by `field_size`, and the bias factor.
+    # The `GenerateMesh` class includes a special function `get_math_progression` 
+    # for creating the string with the mathematical function.
+    field_size = gmsh.model.mesh.field.add("MathEval")
+    math_exp = get_math_progression(field_distance, min_dx=DX_FAULT, bias=DX_BIAS)
+    gmsh.model.mesh.field.setString(field_size, "F", math_exp)
+
+    # Finally, we use the field `field_size` for the cell size of the mesh.
+    gmsh.model.mesh.field.setAsBackgroundMesh(field_size)
+
+    # Generate Mesh
+    gmsh.model.mesh.generate(3)
+    gmsh.model.mesh.optimize("Laplace2D")
+
+    if filename:
+        gmsh.write(filename)
+    if gui:
+        gmsh.fltk.run()
+
+    gmsh.finalize()
+
 if __name__ == "__main__":
-    Box3DwithFault(startCoords=(startX, startY, startZ), 
+    Box3DwithFaultVolume(startCoords=(startX, startY, startZ), 
                    endCoords=(endX, endY, endZ),
-                   filename=f'{output_dir}/box_3d_with_fault.msh',
+                   filename=f'{output_dir}/box_3d_with_faultvolume.msh',
                    boundaries=boundaries_3D,
                    DX_FAULT=1.5,
                    DX_BIAS=1.12,
                    gmsh_verbosity=1,
-                   gui=False)
+                   gui=True)
+
+0/0
 
 
 def extract_fault_surface(input_msh: str,
@@ -475,46 +702,5 @@ if __name__ == "__main__":
 
 
 
-# +
-import gmsh
-import sys
-import numpy as np
-
-gmsh.initialize()
-gmsh.model.add("ImplicitSurface")
-
-# Define the region (box) where we search for the isosurface
-xmin, ymin, zmin = -1.5, -1.5, -1.5
-dx, dy, dz = 3.0, 3.0, 3.0
-box = gmsh.model.occ.addBox(xmin, ymin, zmin, dx, dy, dz)
-gmsh.model.occ.synchronize()
-
-# Define the implicit function as a MathEval field (e.g., sphere: x^2 + y^2 + z^2 - 1)
-field = gmsh.model.mesh.field.add("MathEval")
-gmsh.model.mesh.field.setString(field, "F", "x^2 + y^2 + z^2 - 1")
-
-# Now use the Isosurface plugin
-# (This is a plugin, so you need to run the plugin after setting parameters)
-iso = gmsh.plugin.setNumber("Isosurface", "Field", field)
-gmsh.plugin.setNumber("Isosurface", "Value", 0.0)  # Level set value (isosurface)
-gmsh.plugin.setNumber("Isosurface", "ExtractVolume", 0)  # Surface only
-gmsh.plugin.setNumber("Isosurface", "Map", 0)  # Do not map fields to result
-
-# Run the plugin
-gmsh.plugin.run("Isosurface")
-
-# Generate the mesh (not strictly needed for surface, but safe)
-gmsh.model.mesh.generate(2)
-
-# Optionally, save the mesh
-gmsh.write("implicit_surface.msh")
-
-# Launch the GUI to view, if desired
-if '-nopopup' not in sys.argv:
-    gmsh.fltk.run()
-
-gmsh.finalize()
-
-# -
 
 

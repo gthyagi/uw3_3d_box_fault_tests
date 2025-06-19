@@ -1,4 +1,4 @@
-# ### Case2: Refined mesh with no fault
+# ### Case4: Mesh with fault Volume
 
 import underworld3 as uw
 import numpy as np
@@ -7,6 +7,7 @@ import os
 from enum import Enum
 from underworld3 import timing
 import pyvista as pv
+import math
 
 if uw.mpi.size == 1:
     # to fix trame issue
@@ -22,7 +23,7 @@ os.environ["UW_TIMING_ENABLE"] = "1"
 # +
 # output dir
 output_dir = os.path.join(os.path.join("./output/"), 
-                          f'box_3d_refined_iso_visc')
+                          f'box_3d_with_faultvol_iso_visc')
 
 if uw.mpi.rank == 0:
     os.makedirs(output_dir, exist_ok=True)
@@ -47,6 +48,7 @@ class boundaries_3D(Enum):
     Left = 14
     Front = 15
     Back = 16
+    Fault = 17
 
 class boundary_normals_3D(Enum):
     Bottom = sympy.Matrix([0, 0, 1])
@@ -60,7 +62,7 @@ class boundary_normals_3D(Enum):
 # -
 
 # create mesh
-mesh = uw.discretisation.Mesh(f'./output/meshes/box_3d_refined_around_fault.msh', 
+mesh = uw.discretisation.Mesh(f'./output/meshes/box_3d_with_faultvolume.msh', 
                               boundaries=boundaries_3D, 
                               boundary_normals=boundary_normals_3D, 
                               useMultipleTags=True, 
@@ -138,10 +140,9 @@ stokes = uw.systems.Stokes(mesh, velocityField=v_soln, pressureField=p_soln)
 stokes.constitutive_model = uw.constitutive_models.TransverseIsotropicFlowModel
 stokes.constitutive_model.Parameters.eta_0 = 1
 stokes.constitutive_model.Parameters.eta_1 = 0 + sympy.Piecewise(
-    (0.001, fault_dist.sym[0] < mesh.get_min_radius() * 2),
+    (0.001, fault_dist.sym[0] < mesh.get_min_radius() * 1.5),
     (1, True),
 )
-
 stokes.constitutive_model.Parameters.director = fault_norm.sym
 
 stokes.penalty = 1.0
@@ -230,7 +231,7 @@ if uw.mpi.size == 1:
 
 # +
 # input dir
-input_dir_ref = os.path.join(os.path.join("./output/"), f'box_3d_no_fault_iso_visc')
+input_dir_ref = os.path.join(os.path.join("./output/"), f'box_3d_iso_visc_no_fault')
 
 # load mesh
 mesh_ref = uw.discretisation.Mesh(f'{input_dir_ref}/mesh.msh.h5')
@@ -254,9 +255,15 @@ v_sol_diff_non_ref = uw.discretisation.MeshVariable('V_diff', mesh, mesh.data.sh
 with mesh.access(v_sol_diff_non_ref):
     v_sol_diff_non_ref.data[...] = uw.function.evalf(v_soln_ref2nonref.sym - v_soln.sym, v_sol_diff_non_ref.coords)
 
+# +
 # saving h5 and xdmf file
-mesh.petsc_save_checkpoint(index=0, meshVars=[v_soln, p_soln, strain_rate_inv2, fault_dist, fault_norm, 
-                                              v_soln_ref2nonref, v_sol_diff_non_ref], outputPath=os.path.relpath(output_dir)+'/output')
+
+mesh.petsc_save_checkpoint(index=0, meshVars=[v_soln, p_soln, strain_rate_inv2, fault_norm, fault_dist, 
+                                              v_soln_ref2nonref, v_sol_diff_non_ref], 
+                           outputPath=os.path.relpath(output_dir)+'/output')
+
+# mesh.write_timestep('output', index=0, outputPath=output_dir,
+#                     meshVars=[v_soln, p_soln, strain_rate_inv2, fault_norm, fault_dist])
 
 # +
 # working method for reload

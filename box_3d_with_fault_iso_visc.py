@@ -22,7 +22,7 @@ os.environ["UW_TIMING_ENABLE"] = "1"
 # +
 # output dir
 output_dir = os.path.join(os.path.join("./output/"), 
-                          f'box_3d_iso_visc_with_fault')
+                          f'box_3d_with_fault_iso_visc')
 
 if uw.mpi.rank == 0:
     os.makedirs(output_dir, exist_ok=True)
@@ -229,7 +229,51 @@ if uw.mpi.size == 1:
     
     pl.show()
 
+# +
+# input dir
+input_dir_ref = os.path.join(os.path.join("./output/"), f'box_3d_no_fault_iso_visc')
+
+# load mesh
+mesh_ref = uw.discretisation.Mesh(f'{input_dir_ref}/mesh.msh.h5')
+
+# create mesh variable
+v_soln_ref = uw.discretisation.MeshVariable('V', mesh_ref, mesh_ref.data.shape[1], degree=vdegree)
+
+# load mesh variable
+v_soln_ref.read_timestep(data_filename='v_sol', data_name='V', index=0, outputPath=input_dir_ref)
+# -
+
+# fault mesh variable to store reference velocity with no fault
+v_soln_ref2nonref = uw.discretisation.MeshVariable('V_ref', mesh, mesh.data.shape[1], degree=vdegree)
+
+# transferring information b/w meshvariables
+uw.adaptivity.mesh2mesh_meshVariable(v_soln_ref, v_soln_ref2nonref, )
+
+# mesh variable for diff on fault mesh
+v_sol_diff_non_ref = uw.discretisation.MeshVariable('V_diff', mesh, mesh.data.shape[1], degree=vdegree)
+
+with mesh.access(v_sol_diff_non_ref):
+    v_sol_diff_non_ref.data[...] = uw.function.evalf(v_soln_ref2nonref.sym - v_soln.sym, v_sol_diff_non_ref.coords)
+
 # saving h5 and xdmf file
-mesh.petsc_save_checkpoint(index=0, meshVars=[v_soln, p_soln, strain_rate_inv2, fault_dist, fault_norm], outputPath=os.path.relpath(output_dir)+'/output')
+mesh.petsc_save_checkpoint(index=0, meshVars=[v_soln, p_soln, strain_rate_inv2, fault_dist, fault_norm, 
+                                              v_soln_ref2nonref, v_sol_diff_non_ref], 
+                           outputPath=os.path.relpath(output_dir)+'/output')
+
+# +
+# working method for reload
+# mesh_h5_name = f'{output_dir}/output_mesh.h5'
+
+# mesh_h5 = mesh.write(mesh_h5_name, index=0)
+# v_soln.write(f'{output_dir}/v_sol.mesh.V.00000.h5')
+# p_soln.write(f'{output_dir}/p_sol.mesh.P.00000.h5')
+# strain_rate_inv2.write(f'{output_dir}/sr_inv.mesh.eps.00000.h5')
+
+# v_soln.save(mesh_h5_name, name='V')
+# p_soln.save(mesh_h5_name, name='P')
+# strain_rate_inv2.save(mesh_h5_name, name='eps')
+
+# mesh.generate_xdmf(mesh_h5_name)
+# -
 
 
